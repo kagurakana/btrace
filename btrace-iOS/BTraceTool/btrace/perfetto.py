@@ -39,11 +39,11 @@ class AutoIncrease:
 # 上百条并发等待会散成上百条轨道。
 # 最终做法：**在转换器里先做一次分层**（贪心区间划分，同层区间严格不重叠），每层一条轨道，
 # 同层不重叠 → 配对必然正确，泳道名保留（第 2 层起叫 `<type> #2`、`#3`…）。
-# 层数 > LANE_CAP 时，只画最长的那些层，其余在首条位置给一个 instant 标记说明少画了多少条。
+# 层数 > LANE_CAP（默认 300）时，只画最长的那些层，其余在首条位置给一个 instant 标记说明少画了多少条。
 # BTRACE_PB_SYNC_SLICES=1 可退回旧行为（一条轨道堆叠，重叠时长度不可信）。
 ASYNC_SLICES = os.environ.get("BTRACE_PB_SYNC_SLICES", "").strip().lower() not in ("1", "true", "on", "yes")
 
-LANE_CAP = int(os.environ.get("BTRACE_PB_LANE_CAP", "128") or 128)
+LANE_CAP = int(os.environ.get("BTRACE_PB_LANE_CAP", "300") or 300)
 
 
 def plan_lanes(items: List[PerfettoSliceInfo]):

@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Dict, List, Union
 from btrace.pb import perfetto_pb2
 from btrace.model import CPUSample, MethodNode, MethodTree, PerfettoCounterInfo, PerfettoSliceInfo, SymbolInfo, TraceRawContent
@@ -22,13 +23,73 @@ PACKET_SEQ_ID = 1
 class AutoIncrease:
     def __init__(self):
         self.val = 0
-        
+
     def get(self):
         self.val += 1
         return self.val
 
     def reset(self):
         self.val = 0
+
+# 自定义切片（阶段标注 / 异步等待 / hitch-hang）的配对问题（2026-10-19）：
+# Perfetto 对「同步切片」（TYPE_SLICE_BEGIN/END 打在一条轨道上）是按「时间排序后的栈」配对的，
+# 同一轨道上并发的区间排序后是 B B B E E…，于是时长会互相错配（实测：一条真实 224ms 的请求
+# 被画成 83ms、302ms 的变成 38ms）。也试过 legacy 异步切片（phase 'b'/'e' + unscoped_id），
+# 但 TP 会把它们按切片名重挂到全局异步轨道集，泳道名（await_net 之类）就没了，冷启动那种
+# 上百条并发等待会散成上百条轨道。
+# 最终做法：**在转换器里先做一次分层**（贪心区间划分，同层区间严格不重叠），每层一条轨道，
+# 同层不重叠 → 配对必然正确，泳道名保留（第 2 层起叫 `<type> #2`、`#3`…）。
+# 层数 > LANE_CAP 时，只画最长的那些层，其余在首条位置给一个 instant 标记说明少画了多少条。
+# BTRACE_PB_SYNC_SLICES=1 可退回旧行为（一条轨道堆叠，重叠时长度不可信）。
+ASYNC_SLICES = os.environ.get("BTRACE_PB_SYNC_SLICES", "").strip().lower() not in ("1", "true", "on", "yes")
+
+LANE_CAP = int(os.environ.get("BTRACE_PB_LANE_CAP", "128") or 128)
+
+
+def plan_lanes(items: List[PerfettoSliceInfo]):
+    """把同一 type 的区间按时间分层：同层严格不重叠（零宽标记不占层）。
+
+    返回 (lanes, dropped)：lanes = [[PerfettoSliceInfo, ...], ...]，层数 = 该 type 的并发度；
+    dropped = 因 LANE_CAP 没画的区间（调用方给一条 instant 说明）。
+    """
+    lanes: List[List[PerfettoSliceInfo]] = []
+    lane_ends: List[int] = []
+    for item in sorted(items, key=lambda x: (x.begin_time, x.end_time)):
+        if item.end_time <= item.begin_time:          # 零宽标记：不会和任何区间交叉，放第一层
+            if not lanes:
+                lanes.append([]); lane_ends.append(item.end_time)
+            lanes[0].append(item)
+            continue
+        for d, last_end in enumerate(lane_ends):
+            if item.begin_time > last_end:            # 严格不重叠（同刻相接也换层，避免同 ts 事件歧义）
+                lanes[d].append(item); lane_ends[d] = item.end_time
+                break
+        else:
+            lanes.append([item]); lane_ends.append(item.end_time)
+
+    if LANE_CAP and len(lanes) > LANE_CAP:
+        # 保留"最长区间"所在的层，其余丢掉并在图上标出来（宁可少画，也不画错）
+        def lane_weight(lane):
+            return max((x.end_time - x.begin_time) for x in lane)
+        keep = sorted(range(len(lanes)), key=lambda d: lane_weight(lanes[d]), reverse=True)[:LANE_CAP]
+        keep_set = set(keep)
+        dropped = [x for d, lane in enumerate(lanes) if d not in keep_set for x in lane]
+        lanes = [lanes[d] for d in sorted(keep_set)]
+    else:
+        dropped = []
+    return lanes, dropped
+
+
+def gen_instant_event_packet(uuid: int, timestamp: int, name: str) -> perfetto_pb2.TracePacket:
+    """零宽标记（instant）：渲染成竖线 + 名字，没有时长语义"""
+    track_event = perfetto_pb2.TrackEvent(type=perfetto_pb2.TrackEvent.Type.TYPE_INSTANT,
+                                          track_uuid=uuid)
+    track_event.name = name
+    event_packet = perfetto_pb2.TracePacket(timestamp=timestamp)
+    event_packet.track_event.CopyFrom(track_event)
+    event_packet.trusted_packet_sequence_id = PACKET_SEQ_ID
+    return event_packet
+
 
 def gen_root_packet(uuid: int) -> perfetto_pb2.TracePacket:
     child_ordering = perfetto_pb2.TrackDescriptor.ChildTracksOrdering.EXPLICIT
@@ -204,24 +265,44 @@ def gen_perfetto_trace(method_tree_list: List[MethodTree],
             
     for slice_type, v in slice_info_map.items():
         slice_info_list: List[PerfettoSliceInfo] = v
-        slice_packet = gen_sub_packet(auto_increase.get(), root_uuid, f"{slice_type}")
-        trace_packet_list.append(slice_packet)
-        
-        for slice_info in slice_info_list:
-            slice_name: str = ""
-            if len(slice_info.name):
-                slice_name = slice_info.name
-            else:
-                slice_name = slice_type
+        if ASYNC_SLICES:
+            lanes, dropped = plan_lanes(slice_info_list)
+            if dropped:
+                print(f"[pb] {slice_type}: 并发 {len(lanes) + 1} 层超过 LANE_CAP={LANE_CAP}，"
+                      f"只画最长的 {len(lanes)} 层，另有 {len(dropped)} 条未画")
+        else:
+            lanes, dropped = [slice_info_list], []       # 旧行为：一条轨道全堆叠
 
-            debug_info = slice_info.debug_info
+        for lane_index, lane_items in enumerate(lanes, start=1):
+            lane_name = f"{slice_type}" if lane_index == 1 else f"{slice_type} #{lane_index}"
+            slice_packet = gen_sub_packet(auto_increase.get(), root_uuid, lane_name)
+            trace_packet_list.append(slice_packet)
             slice_track = slice_packet.track_descriptor
-            begin_time = slice_info.begin_time * 1000
-            start_packet = gen_slice_event_packet(slice_track.uuid, begin_time, slice_name, perfetto_pb2.TrackEvent.Type.TYPE_SLICE_BEGIN, debug_info)
-            trace_packet_list.append(start_packet)
-            end_time = slice_info.end_time * 1000
-            end_packet = gen_slice_event_packet(slice_track.uuid, end_time, slice_name, perfetto_pb2.TrackEvent.Type.TYPE_SLICE_END)
-            trace_packet_list.append(end_packet)
+
+            # 被 LANE_CAP 丢掉的：在首条位置给一个 instant，说明少画了多少（不静默丢数据）
+            if lane_index == 1 and dropped:
+                durs = sorted((x.end_time - x.begin_time) / 1000.0 for x in dropped)
+                first_ts = min(x.begin_time for x in dropped) * 1000
+                trace_packet_list.append(gen_instant_event_packet(
+                    slice_track.uuid, first_ts,
+                    f"others: {len(dropped)} waits/segments not drawn "
+                    f"(p50 {durs[len(durs)//2]:.0f}ms, max {durs[-1]:.0f}ms)"))
+
+            for slice_info in lane_items:
+                slice_name: str = slice_info.name if len(slice_info.name) else slice_type
+                debug_info = slice_info.debug_info
+                begin_time = slice_info.begin_time * 1000
+                end_time = slice_info.end_time * 1000
+                if end_time > begin_time:
+                    trace_packet_list.append(gen_slice_event_packet(
+                        slice_track.uuid, begin_time, slice_name,
+                        perfetto_pb2.TrackEvent.Type.TYPE_SLICE_BEGIN, debug_info))
+                    trace_packet_list.append(gen_slice_event_packet(
+                        slice_track.uuid, end_time, slice_name,
+                        perfetto_pb2.TrackEvent.Type.TYPE_SLICE_END))
+                else:                                     # 零宽的 .start/.end 标记 → instant
+                    trace_packet_list.append(gen_instant_event_packet(
+                        slice_track.uuid, begin_time, slice_name))
 
     thread_info_map = raw_content.thread_info_map
     

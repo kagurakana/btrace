@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import math
 import os
 from typing import Dict, List, Union
@@ -44,6 +45,43 @@ class AutoIncrease:
 ASYNC_SLICES = os.environ.get("BTRACE_PB_SYNC_SLICES", "").strip().lower() not in ("1", "true", "on", "yes")
 
 LANE_CAP = int(os.environ.get("BTRACE_PB_LANE_CAP", "300") or 300)
+
+# 同一 type 下「同名且重复次数很多」的区间（典型：cookie 同步这种每次变更都 schedule 一次的防抖等待，
+# 一次冷启动能积几百条），逐条画只是把图淹掉、信息量为零。超过该阈值就合成一条汇总区间：
+# 区间取 [最早开始, 最晚结束]，名字前加 `×N`，debug 里带 count / waited 的 p50、min、max。
+# 0 = 不合并。原始记录仍在 sqlite 里，不丢数据。
+MERGE_MIN = int(os.environ.get("BTRACE_PB_MERGE_MIN", "20") or 0)
+
+
+def merge_repeats(items: List[PerfettoSliceInfo]) -> List[PerfettoSliceInfo]:
+    """把同名高频区间合成一条汇总（只影响 pb 的展示，sqlite 里的逐条记录不变）"""
+    if not MERGE_MIN:
+        return items
+    by_name = collections.defaultdict(list)
+    for item in items:
+        by_name[item.name or item.type].append(item)
+    out = []
+    for name, group in by_name.items():
+        if len(group) <= MERGE_MIN:
+            out.extend(group)
+            continue
+        vals = sorted((x.end_time - x.begin_time) / 1000.0 for x in group)
+        debug = dict(group[0].debug_info or {})
+        debug.update({
+            "merged": True,
+            "count": len(group),
+            "waited_ms_p50": round(vals[len(vals) // 2], 1),
+            "waited_ms_min": round(vals[0], 1),
+            "waited_ms_max": round(vals[-1], 1),
+        })
+        out.append(PerfettoSliceInfo(
+            group[0].type,
+            min(x.begin_time for x in group),
+            max(x.end_time for x in group),
+            f"×{len(group)} {name}",
+            debug,
+        ))
+    return out
 
 
 def plan_lanes(items: List[PerfettoSliceInfo]):
@@ -263,8 +301,13 @@ def gen_perfetto_trace(method_tree_list: List[MethodTree],
             counter_event = gen_counter_event_packet(counter_track.uuid, time, val)
             trace_packet_list.append(counter_event)
             
-    for slice_type, v in slice_info_map.items():
-        slice_info_list: List[PerfettoSliceInfo] = v
+    def _type_order(item):
+        name = item[0]
+        fixed = {"await_dispatch_after": 0, "await_net": 1}      # 先等待、后阶段，读图顺序稳定
+        return (fixed.get(name, 2), name)
+
+    for slice_type, v in sorted(slice_info_map.items(), key=_type_order):
+        slice_info_list: List[PerfettoSliceInfo] = merge_repeats(v)
         if ASYNC_SLICES:
             lanes, dropped = plan_lanes(slice_info_list)
             if dropped:
@@ -273,9 +316,19 @@ def gen_perfetto_trace(method_tree_list: List[MethodTree],
         else:
             lanes, dropped = [slice_info_list], []       # 旧行为：一条轨道全堆叠
 
+        # 多层时先建一个同名父轨道，各层挂在它下面：Perfetto 里是个可折叠的组，
+        # 不会和主线程、其它类型交错（单层就保持原来的一条轨道，不改老观感）
+        group_uuid = root_uuid
+        if len(lanes) > 1:
+            group_packet = gen_sub_packet(auto_increase.get(), root_uuid, slice_type)
+            trace_packet_list.append(group_packet)
+            group_uuid = group_packet.track_descriptor.uuid
+
         for lane_index, lane_items in enumerate(lanes, start=1):
-            lane_name = f"{slice_type}" if lane_index == 1 else f"{slice_type} #{lane_index}"
-            slice_packet = gen_sub_packet(auto_increase.get(), root_uuid, lane_name)
+            # 多层的层名叫 `#1..#N`（类型名留给父轨道：查看页按类型名复制父轨道即可整组带走，
+            # 不会因为「层也叫同名」而被单独复制一遍造成重复/交错）；单层直接用类型名。
+            lane_name = slice_type if len(lanes) == 1 else f"#{lane_index}"
+            slice_packet = gen_sub_packet(auto_increase.get(), group_uuid, lane_name)
             trace_packet_list.append(slice_packet)
             slice_track = slice_packet.track_descriptor
 

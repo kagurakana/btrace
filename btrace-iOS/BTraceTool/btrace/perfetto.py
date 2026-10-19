@@ -324,10 +324,14 @@ def gen_perfetto_trace(method_tree_list: List[MethodTree],
             trace_packet_list.append(group_packet)
             group_uuid = group_packet.track_descriptor.uuid
 
+        # 层的名字按层数补零（`#01..#33`、`#001..#222`）：Perfetto 对同一父轨道下的子轨道按
+        # 名字字符串排序，不补零会变成 #1、#10、#11…、#2、#20…（2026-10-19 踩过）。
+        lane_width = len(str(len(lanes)))
         for lane_index, lane_items in enumerate(lanes, start=1):
-            # 多层的层名叫 `#1..#N`（类型名留给父轨道：查看页按类型名复制父轨道即可整组带走，
-            # 不会因为「层也叫同名」而被单独复制一遍造成重复/交错）；单层直接用类型名。
-            lane_name = slice_type if len(lanes) == 1 else f"#{lane_index}"
+            # 类型名留给父轨道：查看页按类型名复制父轨道即可整组带走，不会因为「层也叫同名」
+            # 而被单独复制一遍造成重复/交错；单层（没有组）就直接用类型名。
+            lane_name = (slice_type if len(lanes) == 1
+                         else f"#{lane_index:0{lane_width}d}")
             slice_packet = gen_sub_packet(auto_increase.get(), group_uuid, lane_name)
             trace_packet_list.append(slice_packet)
             slice_track = slice_packet.track_descriptor

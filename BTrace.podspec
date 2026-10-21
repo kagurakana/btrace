@@ -38,10 +38,20 @@ BTrace 的 iOS 端源码（WOA fork）。Core 提供进程内 callstack 采样�
     d.dependency 'GCDWebServer/Core'
   end
 
-  # ===== WOA：注册到 SCLMonitor 的 KIMBTraceMonitor facade（仅 PerformanceTrack/UITest）=====
-  s.subspec 'WOA' do |w|
-    w.source_files = 'btrace-iOS/BTraceWOA/**/*.{h,m,mm}'
-    w.dependency 'SCLMonitor'
-    w.dependency 'BTrace/Core'
+  # ===== All：Core + Debug + WOA 注入，供 Podfile 按配置整体引入 =====
+  s.subspec 'All' do |a|
+    a.source_files         = 'btrace-iOS/BTrace/Classes/**/*.{h,hpp,c,cc,m,mm,cpp}',
+                             'btrace-iOS/BTraceDebug/Debug/**/*.{h,m,mm,c,cc,cpp}',
+                             'btrace-iOS/BTraceWOA/**/*.{h,m,mm}'
+    a.public_header_files  = 'btrace-iOS/BTrace/Classes/BTrace/Core/**/*.h',
+                             'btrace-iOS/BTrace/Classes/TimeSeriesPlugin/BTraceTimeSeriesPlugin.h',
+                             'btrace-iOS/BTrace/Classes/TimeSeriesPlugin/BTraceTimeSeriesData.h'
+    a.private_header_files = 'btrace-iOS/BTraceDebug/Debug/**/*.{h}'
+    a.pod_target_xcconfig  = { 'CLANG_CXX_LANGUAGE_STANDARD' => 'gnu++17' }
+    a.dependency 'fishhook'
+    a.dependency 'Stinger'
+    a.dependency 'GCDWebServer/Core'
+    a.dependency 'SCLMonitor'
+    a.library = 'z', 'sqlite3'
   end
 end

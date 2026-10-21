@@ -70,4 +70,12 @@ typedef void (^BTraceCallback)(NSData *data);
 
 - (void)markType:(int64_t)type __attribute__((objc_direct));
 
+/// Mark the beginning of a named phase, pair with `endPhase:`.
+/// The phase is rendered as a slice on the flame graph.
+- (void)beginPhase:(NSString * _Nonnull)name __attribute__((objc_direct));
+
+/// Mark the end of a phase previously started by `beginPhase:`.
+/// Silently ignored if no matching `beginPhase:` was recorded.
+- (void)endPhase:(NSString * _Nonnull)name __attribute__((objc_direct));
+
 @end

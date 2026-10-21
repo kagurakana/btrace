@@ -23,6 +23,9 @@
 
 #import <mach-o/dyld.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#include <dlfcn.h>
+#include <os/lock.h>
 
 #include <memory>
 #include <unordered_map>
@@ -32,6 +35,8 @@
 #import "InternalUtils.h"
 #import "BTraceDispatchProfilerConfig.h"
 #import "BTraceDispatchProfilerPlugin.h"
+#import "BTraceTimeSeriesData.h"
+#import "BTraceTimeSeriesPlugin.h"
 
 #include "BTraceDataBase.hpp"
 #include "BTraceRecord.hpp"
@@ -64,6 +69,12 @@ typedef unsigned long pthread_priority_t;
 
 constexpr static int BUFFER_MAX_SIZE = 16 * KB;
 
+/// NSURLSessionTask 的完成回调（KVO state → Completed）
+@interface NetworkObserver : NSObject
+@property(nonatomic, strong) NSDictionary *info;
+@property(nonatomic, assign) BOOL registered;
+@end
+
 namespace btrace {
 
     extern uint8_t trace_id;
@@ -75,6 +86,118 @@ namespace btrace {
     static BTraceDispatchProfilerConfig *s_config = nullptr;
     static std::atomic<int32_t> *s_buffer_size = nullptr;
     static int s_period = 200; // ms
+
+    // ================== 异步等待可视化（2026-10-16）==================
+    // dispatch_after 的延迟、网络请求的往返，都是「这段时间什么都没干、只是在等」。
+    // 之前这类时间在 trace 里只是主线程上的一段空白，看不出是谁在等、等了多久。
+    // 做法：把「调度 → 执行」「发出请求 → 拿到响应」之间的区间写成 slice_v2，走 timeseries
+    // 既有通道 → 工具端每个 type 一条异步泳道（有名字、有长度）。量级很小（每个 dispatch_after /
+    // 每个请求各一条），不需要像 dispatch_async 那样采样。
+    static std::atomic<bool> s_await_slice{true};
+    static std::atomic<bool> s_network{true};
+
+    /// 接口延迟注入规则（实验用）：@[@{@"match": 子串, @"ms": N}]，为空则完全不影响行为
+    static NSArray<NSDictionary *> *s_network_delay = nil;
+
+    static int64_t MatchedDelayMs(NSURL *url) {
+        if (s_network_delay.count == 0 || url == nil) {
+            return 0;
+        }
+        NSString *s = url.absoluteString ?: @"";
+        for (NSDictionary *rule in s_network_delay) {
+            NSString *match = [rule objectForKey:@"match"];
+            if (match.length && [s containsString:match]) {
+                return [[rule objectForKey:@"ms"] integerValue];
+            }
+        }
+        return 0;
+    }
+
+    /// 写一条等待区间到 timeseries（type 决定它在 Perfetto 里哪条泳道，name 是显示名）
+    static void EmitWaitSlice(NSString *type, NSString *name,
+                              int64_t begin_epoch_us, int64_t end_epoch_us,
+                              NSDictionary *debug) {
+        if (!s_await_slice.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (end_epoch_us <= begin_epoch_us) {   // 零宽/倒挂的没意义，不画
+            return;
+        }
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        info[@"perfetto_type"] = @"slice_v2";
+        info[@"begin_time"] = @(begin_epoch_us);
+        info[@"end_time"] = @(end_epoch_us);
+        info[@"name"] = name.length ? name : type;
+        if (debug.count) {
+            info[@"debug_info"] = debug;
+        }
+        BTraceTimeSeriesData *data = [[BTraceTimeSeriesData alloc] initWithType:type
+                                                                    Dictionary:info];
+        [[BTraceTimeSeriesPlugin shared] SaveTimeSeriesData:data];
+    }
+
+    /// 返回地址最近的一个符号名（dladdr 只能看到导出符号，够用来标「谁发起的」）
+    /// 启动热路径上同一个调用点可能被调用几百次（如 YKCookieSyncManager 的 11ms debounce），
+    /// dladdr 每次约 1ms，462 次能吃掉 460ms；按调用方地址缓存结果，只解析一次。
+    static NSString *SymbolOfCaller(void *addr) {
+        if (addr == nullptr) {
+            return nil;
+        }
+        static os_unfair_lock s_symbolCacheLock = OS_UNFAIR_LOCK_INIT;
+        static NSMutableDictionary<NSNumber *, id> *s_symbolCache = nil;   // NSNull = 解析不到
+
+        NSNumber *key = @((uintptr_t)addr);
+        os_unfair_lock_lock(&s_symbolCacheLock);
+        id cached = s_symbolCache[key];
+        os_unfair_lock_unlock(&s_symbolCacheLock);
+        if (cached != nil) {
+            return (cached == [NSNull null]) ? nil : (NSString *)cached;
+        }
+
+        Dl_info info = {};
+        NSString *name = nil;
+        if (dladdr(addr, &info) && info.dli_sname) {
+            name = [NSString stringWithUTF8String:info.dli_sname];
+        }
+
+        os_unfair_lock_lock(&s_symbolCacheLock);
+        if (s_symbolCache == nil) {
+            s_symbolCache = [NSMutableDictionary dictionary];
+        }
+        if (s_symbolCache.count > 4096) {       // 长跑防止无界增长
+            [s_symbolCache removeAllObjects];
+        }
+        s_symbolCache[key] = name ?: [NSNull null];
+        os_unfair_lock_unlock(&s_symbolCacheLock);
+        return name;
+    }
+
+    /// dispatch_after 的 when →「还要等多久」毫秒；算不出来返回 -1
+    static int64_t DispatchAfterDelayMs(dispatch_time_t when) {
+        if (when == DISPATCH_TIME_FOREVER) {
+            return -1;
+        }
+        int64_t delta_ns = (int64_t)(when - dispatch_time(DISPATCH_TIME_NOW, 0));
+        if (delta_ns < 0 || delta_ns > 3600LL * NSEC_PER_SEC) {
+            // 不是 dispatch_time(NOW, delta) 的形态，多半来自 dispatch_walltime
+            delta_ns = (int64_t)(when - dispatch_walltime(NULL, 0));
+        }
+        if (delta_ns < 0 || delta_ns > 24LL * 3600 * NSEC_PER_SEC) {
+            return -1;
+        }
+        return delta_ns / NSEC_PER_MSEC;
+    }
+
+    static NSString *QueueLabelOf(dispatch_queue_t queue) {
+        if (queue == NULL) {
+            return nil;
+        }
+        const char *label = dispatch_queue_get_label(queue);
+        if (label == NULL || strlen(label) == 0) {
+            return [NSString stringWithFormat:@"%p", queue];
+        }
+        return [NSString stringWithUTF8String:label];
+    }
 
 #pragma pack(push, 4)
     struct DispatchData {
@@ -204,6 +327,174 @@ namespace btrace {
         
         return NO;
     }
+
+    // ---------------- 网络请求（NSURLSession）----------------
+    // App 的网络栈是 Alamofire（`URLSession.dataTask(with:)` + 自己的 delegate），
+    // 没有 completionHandler 可包，所以直接盯 task 的生命周期：
+    //   `-[NSURLSessionTask resume]` 记「发出」（带调用方符号），KVO `state` 到 Completed 记「回来」。
+    // 只用公开 API；KVO 注册/注销都包了 try-catch，失败就不记这一条，绝不影响 App 行为。
+    static NSMapTable *NetTaskMap(void) {
+        static NSMapTable *map = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            map = [NSMapTable weakToStrongObjectsMapTable];   // key 弱引用：task 走了条目自动消失
+        });
+        return map;
+    }
+
+    static void NetworkEmitSlice(NSURLSessionTask *task, NSDictionary *info) {
+        if (!s_network.load(std::memory_order_relaxed)) {
+            return;
+        }
+        int64_t begin_us = [info[@"begin"] longLongValue];
+        int64_t end_us = Utils::GetCurrentTimeMicros();
+
+        NSHTTPURLResponse *resp = [task.response isKindOfClass:[NSHTTPURLResponse class]]
+                                      ? (NSHTTPURLResponse *)task.response : nil;
+        NSString *name = info[@"name"] ?: @"request";
+        if (task.error) {
+            name = [name stringByAppendingFormat:@" · ✗%ld", (long)task.error.code];
+        } else if (resp) {
+            name = [name stringByAppendingFormat:@" · %ld", (long)resp.statusCode];
+        }
+
+        NSMutableDictionary *debug = [NSMutableDictionary dictionary];
+        debug[@"took_ms"] = @((end_us - begin_us) / 1000);
+        if (resp) {
+            debug[@"status"] = @(resp.statusCode);
+        }
+        debug[@"bytes"] = @(task.countOfBytesReceived);
+        if (info[@"method"]) debug[@"method"] = info[@"method"];
+        if (info[@"url"]) debug[@"url"] = info[@"url"];
+        if (info[@"caller"]) debug[@"caller"] = info[@"caller"];
+        if (task.error) debug[@"error"] = task.error.localizedDescription ?: @"";
+        EmitWaitSlice(@"await_net", name, begin_us, end_us, debug);
+    }
+
+    /// 记录「发出请求」：由 swizzle 后的 -resume 调用；caller 是 resume 的返回地址
+    static void NetworkTaskWillResume(NSURLSessionTask *task, void *caller) {
+        if (!s_running.load(std::memory_order_relaxed) ||
+            !s_network.load(std::memory_order_relaxed)) {
+            return;
+        }
+        NSURLRequest *req = task.originalRequest ?: task.currentRequest;
+        if (req == nil || req.URL == nil) {
+            return;
+        }
+        NSString *method = req.HTTPMethod ?: @"GET";
+        NSString *host = req.URL.host ?: @"";
+        NSString *path = req.URL.path.length ? req.URL.path : @"/";
+        if (req.URL.query.length) {
+            path = [path stringByAppendingFormat:@"?%@", req.URL.query];
+        }
+        NSString *callerName = SymbolOfCaller(caller);
+
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        info[@"begin"] = @(Utils::GetCurrentTimeMicros());
+        info[@"name"] = [NSString stringWithFormat:@"%@ %@%@", method, host, path];
+        info[@"method"] = method;
+        info[@"url"] = req.URL.absoluteString ?: @"";
+        if (callerName) {
+            info[@"caller"] = callerName;
+        }
+
+        NetworkObserver *observer = [[NetworkObserver alloc] init];
+        observer.info = info;
+        // 先入表再注册：observer 必须活到 KVO 回调
+        @synchronized (NetTaskMap()) {
+            [NetTaskMap() setObject:observer forKey:task];
+        }
+        @try {
+            [task addObserver:observer forKeyPath:@"state"
+                      options:NSKeyValueObservingOptionNew context:nil];
+            observer.registered = YES;
+        } @catch (NSException *e) {
+            @synchronized (NetTaskMap()) {
+                [NetTaskMap() removeObjectForKey:task];
+            }
+        }
+    }
+} // namespace btrace
+
+@implementation NetworkObserver
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey, id> *)change
+                       context:(void *)context {
+    if (![keyPath isEqualToString:@"state"] || ![object isKindOfClass:[NSURLSessionTask class]]) {
+        return;
+    }
+    NSInteger state = [[change objectForKey:NSKeyValueChangeNewKey] integerValue];
+    if (state != NSURLSessionTaskStateCompleted) {      // 3：完成（成功/失败/取消都走这里）
+        return;
+    }
+    NSURLSessionTask *task = (NSURLSessionTask *)object;
+    NSDictionary *info = self.info;
+    [self detachFromTask:task];
+    if (info) {
+        btrace::NetworkEmitSlice(task, info);
+    }
+}
+
+/// 注销 KVO + 从表里摘掉（重复调用安全）
+- (void)detachFromTask:(NSURLSessionTask *)task {
+    if (self.registered) {
+        self.registered = NO;
+        @try {
+            [task removeObserver:self forKeyPath:@"state"];
+        } @catch (NSException *e) {
+            // 已经自动注销/被别的 swizzle 动过：忽略
+        }
+    }
+    @synchronized (btrace::NetTaskMap()) {
+        [btrace::NetTaskMap() removeObjectForKey:task];
+    }
+}
+
+@end
+
+/// 装 swizzle：-resume 换成本方法（换完本方法里再调自己就是调原实现）
+@implementation NSURLSessionTask (BTraceNetworkProfiler)
+
+- (void)btrace_network_resume {
+    NSURL *url = (self.originalRequest ?: self.currentRequest).URL;
+    int64_t delay_ms = btrace::MatchedDelayMs(url);
+    btrace::NetworkTaskWillResume(self, __builtin_return_address(0));
+    if (delay_ms > 0 && btrace::s_running.load(std::memory_order_relaxed)) {
+        // 人为延迟（只用于关键路径验证）：把真正的 resume 推迟 N 毫秒。
+        // 交换实现后 `-btrace_network_resume` 就是原实现，所以这里不会递归。
+        NSLog(@"[BTrace] 接口延迟注入 %lldms → %@", (long long)delay_ms, url.absoluteString ?: @"");
+        __weak NSURLSessionTask *weakTask = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay_ms * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            NSURLSessionTask *task = weakTask;
+            if (task != nil) {
+                [task btrace_network_resume];
+            }
+        });
+        return;
+    }
+    [self btrace_network_resume];
+}
+
+@end
+
+namespace btrace {
+
+    static void SwizzleNetworkTask(void) {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            Class cls = NSClassFromString(@"NSURLSessionTask");
+            SEL original = NSSelectorFromString(@"resume");
+            SEL hooked = NSSelectorFromString(@"btrace_network_resume");
+            Method m1 = cls ? class_getInstanceMethod(cls, original) : NULL;
+            Method m2 = cls ? class_getInstanceMethod(cls, hooked) : NULL;
+            if (m1 && m2) {
+                method_exchangeImplementations(m1, m2);
+            }
+        });
+    }
 } // namespace btrace
 
 @interface BTraceDispatchProfilerPlugin ()
@@ -326,6 +617,43 @@ BTRACE_HOOK(void, dispatch_async, dispatch_queue_t queue,
     ORI(dispatch_async)(queue, hook_block);
 }
 
+// dispatch_after：除了原有的采样记录（调用方栈上打一个点），再把「调度 → 执行」之间的
+// 等待画成一条区间 —— 这才是"异步等待"在火焰图上该有的样子（之前只是一段空白）。
+BTRACE_HOOK(void, dispatch_after, dispatch_time_t when, dispatch_queue_t queue,
+            dispatch_block_t block) {
+    if (block == NULL || unlikely(!s_running.load(std::memory_order_relaxed)) ||
+        !s_await_slice.load(std::memory_order_relaxed)) {
+        ORI(dispatch_after)(when, queue, block);
+        return;
+    }
+
+    dispatch_block_t hook_block = dispatch_hook_block(queue, block);
+
+    // 这一层只负责等待区间：begin 在调用方、end 在 block 真正开始跑的那一刻
+    int64_t begin_epoch_us = Utils::GetCurrentTimeMicros();
+    int64_t delay_ms = DispatchAfterDelayMs(when);
+    NSString *caller = SymbolOfCaller(__builtin_return_address(0));
+    NSString *queue_label = QueueLabelOf(queue);
+
+    dispatch_block_t wait_block = ^{
+        int64_t target_epoch_us = Utils::GetCurrentTimeMicros();
+        NSMutableDictionary *debug = [NSMutableDictionary dictionary];
+        debug[@"waited_ms"] = @((target_epoch_us - begin_epoch_us) / 1000);
+        debug[@"delay_ms"] = delay_ms >= 0 ? (id)@(delay_ms) : (id)@"unknown";
+        if (queue_label) debug[@"queue"] = queue_label;
+        NSString *name = delay_ms >= 0
+            ? [NSString stringWithFormat:@"after %lldms", delay_ms]
+            : @"after";
+        if (caller.length) {
+            name = [name stringByAppendingFormat:@" · %@", caller];
+        }
+        EmitWaitSlice(@"await_dispatch_after", name, begin_epoch_us, target_epoch_us, debug);
+        hook_block();
+    };
+
+    ORI(dispatch_after)(when, queue, [wait_block copy]);
+}
+
 __attribute__((objc_direct_members))
 @implementation BTraceDispatchProfilerPlugin
 
@@ -348,6 +676,7 @@ __attribute__((objc_direct_members))
     s_running = false;
 
     [self dispatchAsyncFishhook];
+    SwizzleNetworkTask();
 
     return self;
 }
@@ -381,6 +710,12 @@ __attribute__((objc_direct_members))
     }
 
     s_config = (BTraceDispatchProfilerConfig *)self.config;
+    s_await_slice = config.await_slice;
+    s_network = config.network;
+    s_network_delay = config.network_delay ?: @[];
+    if (s_network_delay.count) {
+        NSLog(@"[BTrace] 网络延迟注入规则：%@", s_network_delay);
+    }
     s_running = true;
 
     EventLoop::Register(s_period, ProcessDispatchSampleBuffer);
@@ -408,6 +743,8 @@ __attribute__((objc_direct_members))
     }
 
     s_running = false;
+    s_network = false;
+    s_network_delay = nil;
 
     while (s_working_thread != 0 || s_main_running) {
         Utils::WaitFor(1);
@@ -462,7 +799,8 @@ __attribute__((objc_direct_members))
     dispatch_async(self.btrace.queue, ^{
       for (uint32_t i = 0; i < _dyld_image_count(); i++) {
           struct rebinding r[] = {
-              REBINDING(dispatch_async)
+              REBINDING(dispatch_async),
+              REBINDING(dispatch_after)
           };
           rebind_symbols_image((void *)_dyld_get_image_header(i),
                                   _dyld_get_image_vmaddr_slide(i), r,

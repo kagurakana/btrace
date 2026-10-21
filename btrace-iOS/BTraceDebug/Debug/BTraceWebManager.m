@@ -6,7 +6,7 @@
 
 #import "BTrace.h"
 #import "BTraceWebManager.h"
-#import <GCDWebServer/GCDWebserver.h>
+#import <GCDWebServer/GCDWebServer.h>
 #import <GCDWebServer/GCDWebServerDataRequest.h>
 #import <GCDWebServer/GCDWebServerDataResponse.h>
 

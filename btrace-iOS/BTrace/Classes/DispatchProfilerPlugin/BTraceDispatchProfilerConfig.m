@@ -32,6 +32,8 @@
     BTraceDispatchProfilerConfig *config = [[BTraceDispatchProfilerConfig alloc] init];
     config.period = 1 * 1000;
     config.bg_period = 1 * 1000;
+    config.await_slice = YES;
+    config.network = YES;
     return config;
 }
 
@@ -41,6 +43,11 @@
     _bg_period = MAX([[data objectForKey:@"bg_period"] intValue], _period);
     _period *= 1000;
     _bg_period *= 1000;
+    // 缺省开启：不希望被"配置里没写"关掉等待区间（这两个字段主要给线上排障时按需关）
+    _await_slice = [data objectForKey:@"await_slice"] ? [[data objectForKey:@"await_slice"] boolValue] : YES;
+    _network = [data objectForKey:@"network"] ? [[data objectForKey:@"network"] boolValue] : YES;
+    id delay = [data objectForKey:@"network_delay"];
+    _network_delay = [delay isKindOfClass:[NSArray class]] ? delay : @[];
     return self;
 }
 

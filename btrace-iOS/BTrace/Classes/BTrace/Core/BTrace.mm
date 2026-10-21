@@ -112,6 +112,7 @@ static void btrace_at_exit() {
 @property(nonatomic, strong, direct) NSDictionary *dumpSampling;
 @property(nonatomic, strong, direct) NSMutableSet<BTracePlugin *> *tracers;
 @property(nonatomic, strong, direct) NSMutableArray<MethodPair *> *methodPairList;
+@property(nonatomic, strong, direct) NSMutableDictionary<NSString *, NSNumber *> *phaseMap;
 @property(nonatomic, strong, direct) BTraceCallback callback;
 
 @end
@@ -1050,6 +1051,83 @@ static void btrace_at_exit() {
 - (void)markType:(int64_t)type {
     int64_t val = 1 << (type - 1);
     _type |= val;
+}
+
+- (void)beginPhase:(NSString *)name {
+    if (!name.length || !_enable) {
+        return;
+    }
+
+    @synchronized(self) {
+        if (!_phaseMap) {
+            _phaseMap = [NSMutableDictionary dictionary];
+        }
+
+        // 绝对墙钟微秒：slice_v2 在工具端会减去 trace_start_time（epoch µs）做时间校准
+        int64_t begin = Utils::GetCurrentTimeMicros();
+        _phaseMap[name] = @(begin);
+    }
+}
+
+- (void)endPhase:(NSString *)name {
+    if (!name.length || !_enable) {
+        return;
+    }
+
+    int64_t beginEpoch = 0;
+    @synchronized(self) {
+        NSNumber *begin = _phaseMap[name];
+        if (!begin) {
+            return;
+        }
+
+        beginEpoch = begin.longLongValue;
+        [_phaseMap removeObjectForKey:name];
+    }
+
+    int64_t endEpoch = Utils::GetCurrentTimeMicros();
+    int64_t duration = endEpoch - beginEpoch;
+
+    if (duration < 0) {
+        return;
+    }
+
+    // 区间色块（带耗时），工具端 slice_v2 分支解析 name/debug_info
+    [self savePhaseSlice:name
+                   begin:beginEpoch
+                     end:endEpoch
+                duration:duration];
+
+    // start/end 零宽 slice，Perfetto 渲染为竖线标记
+    [self savePhaseSlice:[name stringByAppendingString:@".start"]
+                   begin:beginEpoch
+                     end:beginEpoch
+                duration:0];
+    [self savePhaseSlice:[name stringByAppendingString:@".end"]
+                   begin:endEpoch
+                     end:endEpoch
+                duration:0];
+}
+
+- (void)savePhaseSlice:(NSString *)sliceName
+                 begin:(int64_t)begin
+                   end:(int64_t)end
+              duration:(int64_t)duration {
+    NSMutableDictionary *info = [NSMutableDictionary dictionary];
+    info[@"begin_time"] = @(begin);
+    info[@"end_time"] = @(end);
+    info[@"perfetto_type"] = @"slice_v2";
+    info[@"name"] = sliceName;
+
+    if (duration > 0) {
+        info[@"debug_info"] = @{@"duration_ms": @((duration + 999) / 1000)};
+    }
+
+    // type 用 phase 名：工具端按 type 分异步轨道，每个场景独立一条泳道。
+    // 若共用同一轨道，交错区间的 legacy slice（END 不带 name）在 Perfetto 侧会按栈错误配对，
+    // 导致区间时长被拉长（如 cold_start 显示 5s+）。
+    BTraceTimeSeriesData *data = [[BTraceTimeSeriesData alloc] initWithType:sliceName Dictionary:info];
+    [[BTraceTimeSeriesPlugin shared] SaveTimeSeriesData:data];
 }
 
 @end

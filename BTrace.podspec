@@ -1,15 +1,3 @@
-#
-# BTrace —— WOA iOS Pod（GitHub fork 的 func_woa 分支）
-#
-# 仓库：https://github.com/kagurakana/btrace
-# 分支：func_woa
-#
-# 源码沿用上游 btrace-iOS/ 目录布局；本文件位于仓库根目录，
-# 让 CocoaPods 的 :git + :branch 依赖能找到 podspec，同时 source_files
-# 指到 btrace-iOS/ 下的真实源码，避免复制一份源码。
-#
-# 更新方式：在 func_woa 分支上修改 btrace-iOS/BTrace 或 BTraceDebug 后提交。
-
 Pod::Spec.new do |s|
   s.name             = 'BTrace'
   s.version          = '0.1.0'

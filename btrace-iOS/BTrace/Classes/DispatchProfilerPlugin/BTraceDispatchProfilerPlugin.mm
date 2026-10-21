@@ -87,16 +87,12 @@ namespace btrace {
     static std::atomic<int32_t> *s_buffer_size = nullptr;
     static int s_period = 200; // ms
 
-    // ================== 异步等待可视化（2026-10-16）==================
-    // dispatch_after 的延迟、网络请求的往返，都是「这段时间什么都没干、只是在等」。
-    // 之前这类时间在 trace 里只是主线程上的一段空白，看不出是谁在等、等了多久。
-    // 做法：把「调度 → 执行」「发出请求 → 拿到响应」之间的区间写成 slice_v2，走 timeseries
-    // 既有通道 → 工具端每个 type 一条异步泳道（有名字、有长度）。量级很小（每个 dispatch_after /
-    // 每个请求各一条），不需要像 dispatch_async 那样采样。
+    // dispatch_after / NSURLSessionTask 的等待区间写入 timeseries（slice_v2）；
+    // type 决定工具端泳道，name 携带 delay / 请求信息。
     static std::atomic<bool> s_await_slice{true};
     static std::atomic<bool> s_network{true};
 
-    /// 接口延迟注入规则（实验用）：@[@{@"match": 子串, @"ms": N}]，为空则完全不影响行为
+    /// 接口延迟注入规则：@[@{@"match": 子串, @"ms": N}]。
     static NSArray<NSDictionary *> *s_network_delay = nil;
 
     static int64_t MatchedDelayMs(NSURL *url) {
@@ -136,9 +132,7 @@ namespace btrace {
         [[BTraceTimeSeriesPlugin shared] SaveTimeSeriesData:data];
     }
 
-    /// 返回地址最近的一个符号名（dladdr 只能看到导出符号，够用来标「谁发起的」）
-    /// 启动热路径上同一个调用点可能被调用几百次（如 YKCookieSyncManager 的 11ms debounce），
-    /// dladdr 每次约 1ms，462 次能吃掉 460ms；按调用方地址缓存结果，只解析一次。
+    /// 返回调用方最近符号名；dladdr 结果按地址缓存，避免同一调用点重复解析。
     static NSString *SymbolOfCaller(void *addr) {
         if (addr == nullptr) {
             return nil;
@@ -329,10 +323,8 @@ namespace btrace {
     }
 
     // ---------------- 网络请求（NSURLSession）----------------
-    // App 的网络栈是 Alamofire（`URLSession.dataTask(with:)` + 自己的 delegate），
-    // 没有 completionHandler 可包，所以直接盯 task 的生命周期：
-    //   `-[NSURLSessionTask resume]` 记「发出」（带调用方符号），KVO `state` 到 Completed 记「回来」。
-    // 只用公开 API；KVO 注册/注销都包了 try-catch，失败就不记这一条，绝不影响 App 行为。
+    // 通过 -resume 与 KVO state 跟踪 NSURLSessionTask 的开始/结束；
+    // KVO 注册/注销失败时跳过该条区间。
     static NSMapTable *NetTaskMap(void) {
         static NSMapTable *map = nil;
         static dispatch_once_t once;
@@ -617,8 +609,7 @@ BTRACE_HOOK(void, dispatch_async, dispatch_queue_t queue,
     ORI(dispatch_async)(queue, hook_block);
 }
 
-// dispatch_after：除了原有的采样记录（调用方栈上打一个点），再把「调度 → 执行」之间的
-// 等待画成一条区间 —— 这才是"异步等待"在火焰图上该有的样子（之前只是一段空白）。
+// dispatch_after：采样调用方栈，并记录调度到 block 执行的等待区间。
 BTRACE_HOOK(void, dispatch_after, dispatch_time_t when, dispatch_queue_t queue,
             dispatch_block_t block) {
     if (block == NULL || unlikely(!s_running.load(std::memory_order_relaxed)) ||

@@ -1123,9 +1123,7 @@ static void btrace_at_exit() {
         info[@"debug_info"] = @{@"duration_ms": @((duration + 999) / 1000)};
     }
 
-    // type 用 phase 名：工具端按 type 分异步轨道，每个场景独立一条泳道。
-    // 若共用同一轨道，交错区间的 legacy slice（END 不带 name）在 Perfetto 侧会按栈错误配对，
-    // 导致区间时长被拉长（如 cold_start 显示 5s+）。
+    // type 用 phase 名，工具端按 type 分轨道；共用轨道会导致交错区间按栈错误配对。
     BTraceTimeSeriesData *data = [[BTraceTimeSeriesData alloc] initWithType:sliceName Dictionary:info];
     [[BTraceTimeSeriesPlugin shared] SaveTimeSeriesData:data];
 }

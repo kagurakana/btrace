@@ -80,7 +80,7 @@
 
 - (void)dumpWithTag:(NSString *)tag info:(NSString *)info {
     if (tag.length && info.length) {
-        [_btrace dumpWithTag:tag.UTF8String info:info.UTF8String];
+        [_btrace dumpWithTag:tag.UTF8String Info:info.UTF8String];
     } else if (tag.length) {
         [_btrace dumpWithTag:tag.UTF8String];
     } else {

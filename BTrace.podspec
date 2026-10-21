@@ -37,4 +37,11 @@ BTrace 的 iOS 端源码（WOA fork）。Core 提供进程内 callstack 采样�
     d.dependency 'BTrace/Core'
     d.dependency 'GCDWebServer/Core'
   end
+
+  # ===== WOA：注册到 SCLMonitor 的 KIMBTraceMonitor facade（仅 PerformanceTrack/UITest）=====
+  s.subspec 'WOA' do |w|
+    w.source_files = 'btrace-iOS/BTraceWOA/**/*.{h,m,mm}'
+    w.dependency 'SCLMonitor'
+    w.dependency 'BTrace/Core'
+  end
 end

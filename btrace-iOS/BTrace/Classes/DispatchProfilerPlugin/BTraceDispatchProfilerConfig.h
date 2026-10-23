@@ -32,10 +32,7 @@
 @property(nonatomic, assign, direct) intptr_t period;
 @property(nonatomic, assign, direct) intptr_t bg_period;
 
-/// 输出 dispatch_after / 网络请求的等待区间（slice_v2）。
-@property(nonatomic, assign, direct) BOOL await_slice;
-
-/// 输出 NSURLSessionTask 请求区间（swizzle -resume + KVO state）。
+/// 输出 NSURLSessionTask 请求区间（swizzle -resume + KVO state），即 request_waterfall 泳道。
 @property(nonatomic, assign, direct) BOOL network;
 
 /// 按 URL 子串注入固定延迟（毫秒），默认空。

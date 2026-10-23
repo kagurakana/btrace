@@ -36,7 +36,7 @@ class AutoIncrease:
 # Perfetto 对「同步切片」（TYPE_SLICE_BEGIN/END 打在一条轨道上）是按「时间排序后的栈」配对的，
 # 同一轨道上并发的区间排序后是 B B B E E…，于是时长会互相错配（实测：一条真实 224ms 的请求
 # 被画成 83ms、302ms 的变成 38ms）。也试过 legacy 异步切片（phase 'b'/'e' + unscoped_id），
-# 但 TP 会把它们按切片名重挂到全局异步轨道集，泳道名（await_net 之类）就没了，冷启动那种
+# 但 TP 会把它们按切片名重挂到全局异步轨道集，泳道名（request_waterfall 之类）就没了，冷启动那种
 # 上百条并发等待会散成上百条轨道。
 # 最终做法：**在转换器里先做一次分层**（贪心区间划分，同层区间严格不重叠），每层一条轨道，
 # 同层不重叠 → 配对必然正确，泳道名保留（第 2 层起叫 `<type> #2`、`#3`…）。
@@ -303,10 +303,11 @@ def gen_perfetto_trace(method_tree_list: List[MethodTree],
             
     def _type_order(item):
         name = item[0]
-        fixed = {"await_dispatch_after": 0, "await_net": 1}      # 先等待、后阶段，读图顺序稳定
-        return (fixed.get(name, 2), name)
+        fixed = {"request_waterfall": 0}      # 网络请求瀑布置顶，读图顺序稳定
+        return (fixed.get(name, 1), name)
 
     for slice_type, v in sorted(slice_info_map.items(), key=_type_order):
+        display_name = "Request 瀑布" if slice_type == "request_waterfall" else slice_type
         slice_info_list: List[PerfettoSliceInfo] = merge_repeats(v)
         if ASYNC_SLICES:
             lanes, dropped = plan_lanes(slice_info_list)
@@ -320,7 +321,7 @@ def gen_perfetto_trace(method_tree_list: List[MethodTree],
         # 不会和主线程、其它类型交错（单层就保持原来的一条轨道，不改老观感）
         group_uuid = root_uuid
         if len(lanes) > 1:
-            group_packet = gen_sub_packet(auto_increase.get(), root_uuid, slice_type)
+            group_packet = gen_sub_packet(auto_increase.get(), root_uuid, display_name)
             trace_packet_list.append(group_packet)
             group_uuid = group_packet.track_descriptor.uuid
 
@@ -328,9 +329,9 @@ def gen_perfetto_trace(method_tree_list: List[MethodTree],
         # 名字字符串排序，不补零会变成 #1、#10、#11…、#2、#20…（2026-10-19 踩过）。
         lane_width = len(str(len(lanes)))
         for lane_index, lane_items in enumerate(lanes, start=1):
-            # 类型名留给父轨道：查看页按类型名复制父轨道即可整组带走，不会因为「层也叫同名」
-            # 而被单独复制一遍造成重复/交错；单层（没有组）就直接用类型名。
-            lane_name = (slice_type if len(lanes) == 1
+            # 显示名留给父轨道：查看页按显示名复制父轨道即可整组带走，不会因为「层也叫同名」
+            # 而被单独复制一遍造成重复/交错；单层（没有组）就直接用显示名。
+            lane_name = (display_name if len(lanes) == 1
                          else f"#{lane_index:0{lane_width}d}")
             slice_packet = gen_sub_packet(auto_increase.get(), group_uuid, lane_name)
             trace_packet_list.append(slice_packet)

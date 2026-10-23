@@ -87,9 +87,8 @@ namespace btrace {
     static std::atomic<int32_t> *s_buffer_size = nullptr;
     static int s_period = 200; // ms
 
-    // dispatch_after / NSURLSessionTask 的等待区间写入 timeseries（slice_v2）；
-    // type 决定工具端泳道，name 携带 delay / 请求信息。
-    static std::atomic<bool> s_await_slice{true};
+    // NSURLSessionTask 的等待区间写入 timeseries（slice_v2）；
+    // type 决定工具端泳道，name 携带请求信息。
     static std::atomic<bool> s_network{true};
 
     /// 接口延迟注入规则：@[@{@"match": 子串, @"ms": N}]。
@@ -113,9 +112,6 @@ namespace btrace {
     static void EmitWaitSlice(NSString *type, NSString *name,
                               int64_t begin_epoch_us, int64_t end_epoch_us,
                               NSDictionary *debug) {
-        if (!s_await_slice.load(std::memory_order_relaxed)) {
-            return;
-        }
         if (end_epoch_us <= begin_epoch_us) {   // 零宽/倒挂的没意义，不画
             return;
         }
@@ -164,33 +160,6 @@ namespace btrace {
         s_symbolCache[key] = name ?: [NSNull null];
         os_unfair_lock_unlock(&s_symbolCacheLock);
         return name;
-    }
-
-    /// dispatch_after 的 when →「还要等多久」毫秒；算不出来返回 -1
-    static int64_t DispatchAfterDelayMs(dispatch_time_t when) {
-        if (when == DISPATCH_TIME_FOREVER) {
-            return -1;
-        }
-        int64_t delta_ns = (int64_t)(when - dispatch_time(DISPATCH_TIME_NOW, 0));
-        if (delta_ns < 0 || delta_ns > 3600LL * NSEC_PER_SEC) {
-            // 不是 dispatch_time(NOW, delta) 的形态，多半来自 dispatch_walltime
-            delta_ns = (int64_t)(when - dispatch_walltime(NULL, 0));
-        }
-        if (delta_ns < 0 || delta_ns > 24LL * 3600 * NSEC_PER_SEC) {
-            return -1;
-        }
-        return delta_ns / NSEC_PER_MSEC;
-    }
-
-    static NSString *QueueLabelOf(dispatch_queue_t queue) {
-        if (queue == NULL) {
-            return nil;
-        }
-        const char *label = dispatch_queue_get_label(queue);
-        if (label == NULL || strlen(label) == 0) {
-            return [NSString stringWithFormat:@"%p", queue];
-        }
-        return [NSString stringWithUTF8String:label];
     }
 
 #pragma pack(push, 4)
@@ -360,7 +329,7 @@ namespace btrace {
         if (info[@"url"]) debug[@"url"] = info[@"url"];
         if (info[@"caller"]) debug[@"caller"] = info[@"caller"];
         if (task.error) debug[@"error"] = task.error.localizedDescription ?: @"";
-        EmitWaitSlice(@"await_net", name, begin_us, end_us, debug);
+        EmitWaitSlice(@"request_waterfall", name, begin_us, end_us, debug);
     }
 
     /// 记录「发出请求」：由 swizzle 后的 -resume 调用；caller 是 resume 的返回地址
@@ -609,42 +578,6 @@ BTRACE_HOOK(void, dispatch_async, dispatch_queue_t queue,
     ORI(dispatch_async)(queue, hook_block);
 }
 
-// dispatch_after：采样调用方栈，并记录调度到 block 执行的等待区间。
-BTRACE_HOOK(void, dispatch_after, dispatch_time_t when, dispatch_queue_t queue,
-            dispatch_block_t block) {
-    if (block == NULL || unlikely(!s_running.load(std::memory_order_relaxed)) ||
-        !s_await_slice.load(std::memory_order_relaxed)) {
-        ORI(dispatch_after)(when, queue, block);
-        return;
-    }
-
-    dispatch_block_t hook_block = dispatch_hook_block(queue, block);
-
-    // 这一层只负责等待区间：begin 在调用方、end 在 block 真正开始跑的那一刻
-    int64_t begin_epoch_us = Utils::GetCurrentTimeMicros();
-    int64_t delay_ms = DispatchAfterDelayMs(when);
-    NSString *caller = SymbolOfCaller(__builtin_return_address(0));
-    NSString *queue_label = QueueLabelOf(queue);
-
-    dispatch_block_t wait_block = ^{
-        int64_t target_epoch_us = Utils::GetCurrentTimeMicros();
-        NSMutableDictionary *debug = [NSMutableDictionary dictionary];
-        debug[@"waited_ms"] = @((target_epoch_us - begin_epoch_us) / 1000);
-        debug[@"delay_ms"] = delay_ms >= 0 ? (id)@(delay_ms) : (id)@"unknown";
-        if (queue_label) debug[@"queue"] = queue_label;
-        NSString *name = delay_ms >= 0
-            ? [NSString stringWithFormat:@"after %lldms", delay_ms]
-            : @"after";
-        if (caller.length) {
-            name = [name stringByAppendingFormat:@" · %@", caller];
-        }
-        EmitWaitSlice(@"await_dispatch_after", name, begin_epoch_us, target_epoch_us, debug);
-        hook_block();
-    };
-
-    ORI(dispatch_after)(when, queue, [wait_block copy]);
-}
-
 __attribute__((objc_direct_members))
 @implementation BTraceDispatchProfilerPlugin
 
@@ -701,7 +634,6 @@ __attribute__((objc_direct_members))
     }
 
     s_config = (BTraceDispatchProfilerConfig *)self.config;
-    s_await_slice = config.await_slice;
     s_network = config.network;
     s_network_delay = config.network_delay ?: @[];
     if (s_network_delay.count) {
@@ -790,8 +722,7 @@ __attribute__((objc_direct_members))
     dispatch_async(self.btrace.queue, ^{
       for (uint32_t i = 0; i < _dyld_image_count(); i++) {
           struct rebinding r[] = {
-              REBINDING(dispatch_async),
-              REBINDING(dispatch_after)
+              REBINDING(dispatch_async)
           };
           rebind_symbols_image((void *)_dyld_get_image_header(i),
                                   _dyld_get_image_vmaddr_slide(i), r,

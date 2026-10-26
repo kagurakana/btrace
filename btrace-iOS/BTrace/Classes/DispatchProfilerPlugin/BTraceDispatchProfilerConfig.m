@@ -43,8 +43,6 @@
     _period *= 1000;
     _bg_period *= 1000;
     _network = [data objectForKey:@"network"] ? [[data objectForKey:@"network"] boolValue] : YES;
-    id delay = [data objectForKey:@"network_delay"];
-    _network_delay = [delay isKindOfClass:[NSArray class]] ? delay : @[];
     return self;
 }
 

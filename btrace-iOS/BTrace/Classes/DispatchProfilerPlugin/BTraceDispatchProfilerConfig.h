@@ -35,10 +35,6 @@
 /// 输出 NSURLSessionTask 请求区间（swizzle -resume + KVO state），即 request_waterfall 泳道。
 @property(nonatomic, assign, direct) BOOL network;
 
-/// 按 URL 子串注入固定延迟（毫秒），默认空。
-/// 格式：{"network_delay": [{"match": "v1/xz_ui/mobile?scope=user", "ms": 1500}]}
-@property(nonatomic, strong, direct) NSArray<NSDictionary *> *network_delay;
-
 + (nonnull instancetype)defaultConfig;
 
 @end

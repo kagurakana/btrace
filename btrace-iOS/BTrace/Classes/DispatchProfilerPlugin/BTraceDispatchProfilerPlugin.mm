@@ -91,23 +91,6 @@ namespace btrace {
     // type 决定工具端泳道，name 携带请求信息。
     static std::atomic<bool> s_network{true};
 
-    /// 接口延迟注入规则：@[@{@"match": 子串, @"ms": N}]。
-    static NSArray<NSDictionary *> *s_network_delay = nil;
-
-    static int64_t MatchedDelayMs(NSURL *url) {
-        if (s_network_delay.count == 0 || url == nil) {
-            return 0;
-        }
-        NSString *s = url.absoluteString ?: @"";
-        for (NSDictionary *rule in s_network_delay) {
-            NSString *match = [rule objectForKey:@"match"];
-            if (match.length && [s containsString:match]) {
-                return [[rule objectForKey:@"ms"] integerValue];
-            }
-        }
-        return 0;
-    }
-
     /// 写一条等待区间到 timeseries（type 决定它在 Perfetto 里哪条泳道，name 是显示名）
     static void EmitWaitSlice(NSString *type, NSString *name,
                               int64_t begin_epoch_us, int64_t end_epoch_us,
@@ -419,23 +402,7 @@ namespace btrace {
 @implementation NSURLSessionTask (BTraceNetworkProfiler)
 
 - (void)btrace_network_resume {
-    NSURL *url = (self.originalRequest ?: self.currentRequest).URL;
-    int64_t delay_ms = btrace::MatchedDelayMs(url);
     btrace::NetworkTaskWillResume(self, __builtin_return_address(0));
-    if (delay_ms > 0 && btrace::s_running.load(std::memory_order_relaxed)) {
-        // 人为延迟（只用于关键路径验证）：把真正的 resume 推迟 N 毫秒。
-        // 交换实现后 `-btrace_network_resume` 就是原实现，所以这里不会递归。
-        NSLog(@"[BTrace] 接口延迟注入 %lldms → %@", (long long)delay_ms, url.absoluteString ?: @"");
-        __weak NSURLSessionTask *weakTask = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay_ms * NSEC_PER_MSEC),
-                       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-            NSURLSessionTask *task = weakTask;
-            if (task != nil) {
-                [task btrace_network_resume];
-            }
-        });
-        return;
-    }
     [self btrace_network_resume];
 }
 
@@ -635,10 +602,6 @@ __attribute__((objc_direct_members))
 
     s_config = (BTraceDispatchProfilerConfig *)self.config;
     s_network = config.network;
-    s_network_delay = config.network_delay ?: @[];
-    if (s_network_delay.count) {
-        NSLog(@"[BTrace] 网络延迟注入规则：%@", s_network_delay);
-    }
     s_running = true;
 
     EventLoop::Register(s_period, ProcessDispatchSampleBuffer);
@@ -667,7 +630,6 @@ __attribute__((objc_direct_members))
 
     s_running = false;
     s_network = false;
-    s_network_delay = nil;
 
     while (s_working_thread != 0 || s_main_running) {
         Utils::WaitFor(1);
